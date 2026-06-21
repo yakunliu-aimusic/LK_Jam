@@ -11,7 +11,10 @@ public:
     void processPhrase(const std::vector<MidiEventLite>& inputPhrase,
                        std::vector<MidiEventLite>& outputPhrase,
                        const Chord& currentChord,
-                       juce::int64 responseStartSample) override;
+                       juce::int64 responseStartSample,
+                       juce::int64 responseLengthSamples,
+                       double sampleRate,
+                       double bpm) override;
 
     // 🌟 核心修复点 2：实现父类的纯虚函数，使其可以被实例化
     bool loadModel(const juce::File& modelFile) override;

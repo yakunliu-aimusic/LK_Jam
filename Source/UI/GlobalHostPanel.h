@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "../Core/PluginProcessor.h"
+#include "BinaryData.h"  // <--- 新增这一行！
 #include <atomic>
 
 class GlobalHostPanel : public juce::Component {
@@ -56,9 +57,15 @@ public:
         playStopBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff3b82f6));
         playStopBtn.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
         playStopBtn.onClick = [this]() {
-            isPlaying = !isPlaying;
-            playStopBtn.setButtonText(isPlaying ? "STOP" : "PLAY");
-            playStopBtn.setColour(juce::TextButton::buttonColourId, isPlaying ? juce::Colour(0xffef4444) : juce::Colour(0xff3b82f6));
+            const bool newState = !processor.isTransportRunning.load();
+            processor.isTransportRunning.store(newState);
+            if (newState) {
+                processor.resetLoopState();
+            } else {
+                processor.panicTriggered.store(true);
+            }
+            playStopBtn.setButtonText(newState ? "STOP" : "PLAY");
+            playStopBtn.setColour(juce::TextButton::buttonColourId, newState ? juce::Colour(0xffef4444) : juce::Colour(0xff3b82f6));
         };
         addAndMakeVisible(playStopBtn);
 
@@ -66,8 +73,9 @@ public:
         learningBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff64748b));
         learningBtn.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
         learningBtn.onClick = [this]() {
-            isLearning = !isLearning;
-            learningBtn.setColour(juce::TextButton::buttonColourId, isLearning ? juce::Colour(0xff10b981) : juce::Colour(0xff64748b));
+            const bool newState = !processor.isLearning.load();
+            processor.isLearning.store(newState);
+            learningBtn.setColour(juce::TextButton::buttonColourId, newState ? juce::Colour(0xff10b981) : juce::Colour(0xff64748b));
         };
         addAndMakeVisible(learningBtn);
 
@@ -109,14 +117,47 @@ public:
         g.drawRoundedRectangle(bounds, 8.0f, 1.0f);
 
         auto headerBounds = bounds.removeFromTop(70);
-        g.setColour(juce::Colour(0xff0f172a));
-        g.setFont(juce::FontOptions(36.0f, juce::Font::bold));
-        g.drawText("LK Jam", headerBounds.removeFromLeft(160).withTrimmedLeft(16), juce::Justification::centredLeft);
 
+        // --- 1. 设置字体并获取文字的真实宽度 ---
+        juce::Font titleFont(juce::FontOptions(36.0f, juce::Font::bold));
+        g.setFont(titleFont);
+        juce::String titleText = "LK Jam";
+        juce::GlyphArrangement titleGlyphs;
+        titleGlyphs.addLineOfText(titleFont, titleText, 0.0f, 0.0f);
+        float textWidth = titleGlyphs.getBoundingBox(0, -1, true).getWidth();
+
+        // --- 2. 设定 Logo 大小和极近的间距 ---
+        float logoSize = 40.0f;
+        float spacing = 8.0f; // 间距改小到 8 个像素，让它俩贴得更近
+
+        // --- 3. 计算“文字+间距+Logo”的总宽度，求出居中起点 X ---
+        float totalWidth = textWidth + spacing + logoSize;
+        float startX = headerBounds.getX() + (headerBounds.getWidth() - totalWidth) / 2.0f;
+        float centerY = headerBounds.getCentreY();
+
+        // --- 4. 绘制文字 ---
+        juce::Rectangle<float> textBounds(startX, headerBounds.getY(), textWidth, headerBounds.getHeight());
+        g.setColour(juce::Colour(0xff0f172a));
+        g.drawText(titleText, textBounds, juce::Justification::centredLeft);
+
+        // --- 5. 绘制 Logo ---
+        juce::Image logo = juce::ImageCache::getFromMemory (BinaryData::logo_jpg, BinaryData::logo_jpgSize);
+        if (logo.isValid())
+        {
+            // Logo 的 X 坐标紧跟在文字和间距之后
+            float logoX = startX + textWidth + spacing;
+            float logoY = centerY - (logoSize / 2.0f); // 垂直居中
+            juce::Rectangle<float> imageBounds(logoX, logoY, logoSize, logoSize);
+
+            g.drawImage (logo,
+                         imageBounds,
+                         juce::RectanglePlacement::centred | juce::RectanglePlacement::onlyReduceInSize);
+        }
+
+        // --- 绘制底部分隔线 ---
         g.setColour(juce::Colour(0xfff1f5f9));
         g.drawLine(bounds.getX(), bounds.getY(), bounds.getRight(), bounds.getY(), 2.0f);
     }
-
     void resized() override {
         auto bounds = getLocalBounds().reduced(20).withTrimmedTop(82);
 
@@ -149,13 +190,19 @@ private:
         const double bpm = processor.currentBpm.load();
         const double latency = processor.currentLatencyMs.load();
         const int stateInt = processor.getStateMachine().getStateAsInt();
+        const bool transportRunning = processor.isTransportRunning.load();
+        const bool learning = processor.isLearning.load();
 
         juce::MessageManager::callAsync([=]() {
             if (!isAlive()) return;
             if (clockSourceCombo.getSelectedId() != 2) bpmLabel.setText(juce::String::formatted("%.1f", bpm), juce::dontSendNotification);
+            playStopBtn.setButtonText(transportRunning ? "STOP" : "PLAY");
+            playStopBtn.setColour(juce::TextButton::buttonColourId, transportRunning ? juce::Colour(0xffef4444) : juce::Colour(0xff3b82f6));
+            learningBtn.setColour(juce::TextButton::buttonColourId, learning ? juce::Colour(0xff10b981) : juce::Colour(0xff64748b));
             latencyLabel.setText(juce::String::formatted("LATENCY: %.1fms", latency), juce::dontSendNotification);
             if (stateInt == 1) phaseLabel.setText("PHASE: Listening", juce::dontSendNotification);
             else if (stateInt == 2) phaseLabel.setText("PHASE: Responding", juce::dontSendNotification);
+            else if (stateInt == 3) phaseLabel.setText("PHASE: Pre-Roll", juce::dontSendNotification);
             else phaseLabel.setText("PHASE: Idle", juce::dontSendNotification);
         });
     }
@@ -163,12 +210,10 @@ private:
     std::atomic<bool> bIsAlive {false};
     LK_Jam_POCProcessor& processor;
 
-    // --- 在这里声明所有缺失的成员变量 ---
     juce::Label clockSourceTitle, bpmLabel, aiCoreLabel, phaseLabel, modelLabel, latencyLabel;
     juce::ComboBox clockSourceCombo;
     juce::Slider bpmSlider;
     juce::TextButton playStopBtn, learningBtn, panicBtn;
-    bool isPlaying = false, isLearning = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalHostPanel)
 };

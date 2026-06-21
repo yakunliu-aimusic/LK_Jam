@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <juce_core/juce_core.h>
 
 enum class ChordQuality {
@@ -43,9 +44,12 @@ struct Chord {
 
         juce::String rootStr = str.substring(0, 1).toUpperCase();
         int offset = 1;
-        if (str.length() > 1 && (str[1] == '#' || str[1] == 'b')) {
-            rootStr += str.substring(1, 2).toLowerCase();
-            offset = 2;
+        if (str.length() > 1) {
+            const juce::String accidental = str.substring(1, 2);
+            if (accidental == "#" || accidental == "b") {
+                rootStr += accidental.toLowerCase();
+                offset = 2;
+            }
         }
 
         if (rootStr == "C") c.rootMidi = 0;
@@ -110,6 +114,23 @@ struct Chord {
 
 struct Measure {
     Chord chord;
+    std::vector<Chord> beatChords;
+
+    void ensureBeatChords(int beatsPerMeasure) {
+        const int safeBeats = std::max(1, beatsPerMeasure);
+        if (beatChords.size() != static_cast<size_t>(safeBeats)) {
+            beatChords.resize(static_cast<size_t>(safeBeats));
+        }
+    }
+
+    Chord getChordForBeat(int beatIndex, int beatsPerMeasure) const {
+        const int safeBeats = std::max(1, beatsPerMeasure);
+        const int safeBeat = std::clamp(beatIndex, 0, safeBeats - 1);
+        if (beatChords.size() == static_cast<size_t>(safeBeats) && !beatChords[static_cast<size_t>(safeBeat)].isEmpty()) {
+            return beatChords[static_cast<size_t>(safeBeat)];
+        }
+        return chord;
+    }
 };
 
 struct Progression {

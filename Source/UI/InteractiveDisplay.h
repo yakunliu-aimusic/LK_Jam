@@ -37,10 +37,12 @@ public:
 
         transportBar.onPlayToggled = [this](bool playing) {
             isPlaying = playing;
+            processor.isTransportRunning.store(playing);
 
             if (isPlaying) {
                 processor.resetLoopState();
             } else {
+                processor.panicTriggered.store(true);
                 gridCanvas.setPlayingIndex(-1);
             }
 
@@ -57,11 +59,12 @@ public:
 
         // 修复：Reset 时清空进度、重置总循环次数，但不清空用户填好的和弦
         transportBar.onResetClicked = [this]() {
-            processor.resetLoopState(); // 这将触发我们在 Processor 和 SyncEngine 里加的清零逻辑
+            processor.isTransportRunning.store(false);
+            processor.resetLoopState(true);
             isPlaying = false;
             transportBar.setPlayingStateSilently(false);
 
-            // 仅将当前 Progression 的 "总循环次数" (totalLoops) 强制设为 0
+            // Reset progress and total loop count without clearing user chords
             auto prog = processor.getActiveProgression();
             prog.totalLoops = 0;
 
@@ -91,10 +94,9 @@ public:
             }
         };
 
-        auto presets = HarmonyLibrary::getPresets();
-        processor.setActiveProgression(presets[0]);
-        gridCanvas.loadProgression(presets[0]);
-        transportBar.syncSettingsFromProgression(presets[0]);
+        auto activeProg = processor.getActiveProgression();
+        gridCanvas.loadProgression(activeProg);
+        transportBar.syncSettingsFromProgression(activeProg);
     }
 
     ~InteractiveDisplay() override { bIsAlive.store(false); }
@@ -112,6 +114,7 @@ public:
         juce::String roleText = "ROLE: IDLE";
         if (stateInt == 1) { ledColor = juce::Colour(0xff10b981); roleText = "ROLE: HUMAN"; }
         else if (stateInt == 2) { ledColor = juce::Colour(0xfff59e0b); roleText = "ROLE: AI"; }
+        else if (stateInt == 3) { ledColor = juce::Colour(0xff3b82f6); roleText = "ROLE: PRE-ROLL"; }
 
         g.setColour(ledColor);
         g.fillEllipse(roleBounds.getX() + 16.0f, roleBounds.getY() + 18.0f, 14.0f, 14.0f);
@@ -123,7 +126,17 @@ public:
         g.fillRoundedRectangle(progressBarBounds, 6.0f);
 
         // 核心修复：进度条与 Loop 次数显示
-        if (isPlaying) {
+        if (processor.isClockRunning.load()) {
+            if (stateInt == 3) {
+                const double beatsRemaining = processor.getSyncEngine().getPreRollBeatsRemaining();
+                const double secondsRemaining = (beatsRemaining * 60.0) / std::max(1.0, processor.getSyncEngine().getCurrentBpm());
+                g.setColour(juce::Colour(0xff3b82f6));
+                g.fillRoundedRectangle(progressBarBounds.withWidth(progressBarBounds.getWidth()), 6.0f);
+                progressLabel.setText(juce::String::formatted("Pre-Roll: %.1f sec to Loop 0", secondsRemaining), juce::dontSendNotification);
+                progressLabel.setColour(juce::Label::textColourId, juce::Colours::white);
+                return;
+            }
+
             auto prog = processor.getActiveProgression();
             double ppq = processor.getCurrentRelativePpq();
             double loopBeats = std::max(1.0, prog.getTotalBeats());
@@ -181,10 +194,10 @@ public:
     void updateStateSafe() {
         if (!isAlive()) return;
 
-        int stateInt = processor.getStateMachine().getStateAsInt();
-        if (stateInt == 0 && isPlaying) {
-            isPlaying = false;
-            transportBar.setPlayingStateSilently(false);
+        const bool transportRunning = processor.isClockRunning.load();
+        if (transportRunning != isPlaying) {
+            isPlaying = transportRunning;
+            transportBar.setPlayingStateSilently(transportRunning);
         }
 
         int tCount = processor.uiToAiCount.load();
@@ -204,7 +217,7 @@ public:
         }
 
         int activeMeasureIdx = -1;
-        if (isPlaying) {
+        if (processor.isClockRunning.load()) {
             double currentPpq = processor.getCurrentRelativePpq();
             auto prog = processor.getActiveProgression();
             double accumulatedBeats = 0.0;
@@ -234,7 +247,7 @@ public:
             toAiLabel.setText(toStr, juce::dontSendNotification);
             fromAiLabel.setText(fromStr, juce::dontSendNotification);
 
-            if (isPlaying) gridCanvas.setPlayingIndex(activeMeasureIdx);
+            if (processor.isClockRunning.load()) gridCanvas.setPlayingIndex(activeMeasureIdx);
             else gridCanvas.setPlayingIndex(-1);
 
             if (metronomeEnabled) transportBar.updateMetronomeDisplay(isFlash, beatFraction);

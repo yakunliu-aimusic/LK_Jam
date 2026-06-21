@@ -14,7 +14,7 @@ add_subdirectory(./JUCE ./JUCE)
 
 juce_add_plugin(LK_Jam
         COMPANY_NAME "LK_ai_music"
-        PLUGIN_NAME "LK_Jam_1.00"
+        PLUGIN_NAME "LK_Jam_1.01"
         IS_SYNTH FALSE
         NEEDS_MIDI_INPUT TRUE
         NEEDS_MIDI_OUTPUT TRUE
@@ -24,7 +24,7 @@ juce_add_plugin(LK_Jam
         PLUGIN_MANUFACTURER_CODE Lkai
         PLUGIN_CODE LkJ2
         FORMATS VST3 AU Standalone
-        PRODUCT_NAME "LK_Jam_1.00"
+        PRODUCT_NAME "LK_Jam_1.01"
 )
 
 juce_generate_juce_header(LK_Jam)
@@ -52,6 +52,13 @@ target_compile_options(LK_Jam
         -Wno-unused-parameter
 )
 
+# 1. 注册你的图片资源，注意这里改成了 Assets 并使用了绝对路径策保不出错
+juce_add_binary_data(LK_Jam_BinaryData
+        SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/logo.jpg"
+)
+
+# 2. 将所有库（包含 BinaryData）一次性链接给 LK_Jam
 target_link_libraries(LK_Jam
         PRIVATE
         juce::juce_audio_utils
@@ -60,20 +67,12 @@ target_link_libraries(LK_Jam
         juce::juce_graphics
         juce::juce_events
         juce::juce_core
+        LK_Jam_BinaryData       # <--- 你的图片数据绑定在这里
         PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
 
-target_sources(LK_Jam_Standalone PRIVATE
-        # ... 其他现有的源文件 ...
-
-        # 🌟 新增的马尔可夫算法适配器与源码
-        Source/Engine/MarkovEngine.cpp
-        Source/Engine/MarkovEngine.h
-        Source/Engine/Markov/MarkovChain.cpp
-        Source/Engine/Markov/MarkovChain.h
-        Source/Engine/Markov/MarkovManager.cpp
-        Source/Engine/Markov/MarkovManager.h
-)
+# 注意：我去掉了冗余的 target_sources(LK_Jam_Standalone ...)，
+# 因为上面的 GLOB_RECURSE 已经把你 Source 目录下的马尔可夫等所有文件自动抓取给 LK_Jam 了。

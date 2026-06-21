@@ -11,14 +11,18 @@ bool RTNeuralEngine::loadModel(const juce::File& modelFile) {
 
     currentModelName = modelFile.getFileName();
     modelReady.store(true);
-    DBG("✅ Model loaded: " << currentModelName);
+    DBG("[LK] Model loaded: " << currentModelName);
     return true;
 }
 
 void RTNeuralEngine::processPhrase(const std::vector<MidiEventLite>& inputPhrase,
                                    std::vector<MidiEventLite>& outputPhrase,
                                    const Chord& currentChord,
-                                   juce::int64 responseStartSample) {
+                                   juce::int64 responseStartSample,
+                                   juce::int64 responseLengthSamples,
+                                   double sampleRate,
+                                   double bpm) {
+    juce::ignoreUnused(responseLengthSamples, sampleRate, bpm);
     if (!modelReady.load()) return; // 防御：模型没加载就直接返回
 
     std::vector<float> inputFeatures = preprocessData(inputPhrase, currentChord);

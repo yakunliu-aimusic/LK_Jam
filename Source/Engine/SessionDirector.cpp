@@ -7,24 +7,20 @@ void SessionDirector::process(juce::AudioProcessorValueTreeState& apvts,
                               const juce::MidiBuffer& midiMessages,
                               bool uiForceLearning)
 {
-    // 1. 监听外部 MIDI 触发 (例如：踏板发送 CC 64，或特定最低音 C-2)
-    evaluateMidiTriggers(midiMessages);
+    if (sync.getSyncMode() == 1) {
+        return;
+    }
 
-    // 2. 监听宿主 Automation 曲线
+    evaluateMidiTriggers(midiMessages);
     evaluateAutomation(apvts);
 
-    // 3. 综合判断，覆写状态
-    // 如果用户在 UI 点了 LEARNING，或者踩了踏板，强制进入 Listening（缓冲输入）
     if (uiForceLearning || isMidiTriggered || isAutomationTriggered) {
         sm.setState(InteractionState::Listening);
-
-        // 告诉时钟引擎，不要按默认的小节循环走了，现在是手动模式
         sync.setOverrideMode(true);
     } else {
-        // 如果没人干预，并且处于 Override 模式，说明刚刚放开了踏板/停止了Automation
         if (sync.isOverridden()) {
-            sm.setState(InteractionState::Responding); // 踏板一松，立刻爆发响应！
-            sync.setOverrideMode(false); // 恢复正常循环
+            sm.setState(InteractionState::Responding);
+            sync.setOverrideMode(false);
         }
     }
 }
@@ -47,10 +43,13 @@ void SessionDirector::evaluateMidiTriggers(const juce::MidiBuffer& midiMessages)
 }
 
 void SessionDirector::evaluateAutomation(juce::AudioProcessorValueTreeState& apvts) {
-    // 假设你在 APVTS 里加了一个叫 "aiTrigger" 的参数
+    if (sync.getSyncMode() == 1) {
+        isAutomationTriggered = false;
+        return;
+    }
+
     if (auto* param = apvts.getRawParameterValue("aiTrigger")) {
         float val = param->load();
-        // 画线超过 0.5，视为进入强行介入模式
         isAutomationTriggered = (val > 0.5f);
     }
 }

@@ -23,13 +23,31 @@ public:
 
     void setEngine(std::unique_ptr<IInferenceEngine> engine);
     void clearQueues();
-    void submitInputPhrase(const std::vector<MidiEventLite>& input, const Chord& chord, juce::int64 startSample);
+    void submitInputPhrase(const std::vector<MidiEventLite>& input,
+                           const Chord& chord,
+                           juce::int64 startSample,
+                           juce::int64 responseLengthSamples,
+                           double sampleRate,
+                           double bpm);
+
+    void submitFallbackPhrase(const std::vector<MidiEventLite>& input,
+                              const Chord& chord,
+                              juce::int64 startSample,
+                              juce::int64 responseLengthSamples,
+                              double sampleRate,
+                              double bpm);
 
     bool loadModel(const juce::File& file) {
         if (inferenceEngine != nullptr) {
             return inferenceEngine->loadModel(file);
         }
         return false;
+    }
+
+    void resetModelMemory() {
+        if (inferenceEngine != nullptr) {
+            inferenceEngine->resetModelMemory();
+        }
     }
 
     void run() override;
@@ -44,6 +62,12 @@ private:
 
     Chord currentChordCtx;
     juce::int64 currentStartSample = 0;
+    juce::int64 currentResponseLengthSamples = 0;
+    double currentSampleRate = 44100.0;
+    double currentBpm = 120.0;
+
+    enum class TaskMode { Model, Fallback };
+    TaskMode currentTaskMode = TaskMode::Model;
 
     juce::WaitableEvent triggerEvent;
     std::atomic<bool> isProcessing{false};

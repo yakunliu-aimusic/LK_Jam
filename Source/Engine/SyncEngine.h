@@ -4,7 +4,7 @@
 
 class SyncEngine {
 public:
-    void update(juce::AudioPlayHead* playHead, StateMachine& stateMachine, int turnBars, int cycleBars, double sampleRate, int numSamples);
+    void update(juce::AudioPlayHead* playHead, StateMachine& stateMachine, int turnBars, int cycleBars, double sampleRate, int numSamples, bool transportRunning);
 
     bool isStateChangedThisBlock() const { return stateChangedThisBlock; }
     bool isUsingHostClock() const       { return hostSynced; }
@@ -12,14 +12,23 @@ public:
     int getCurrentBarIndex() const      { return currentBarIndex; }
     double getCurrentPpq() const        { return currentPpq; }
     double getPpqPerBar() const         { return ppqPerBar; }
+    double getPreRollBeatsRemaining() const { return preRollBeatsRemaining; }
 
+    int getSyncMode() const             { return syncMode; }
     void setSyncMode(int mode) { syncMode = mode; }
     void setManualBpm(double bpm) { manualBpm = bpm; }
 
     void setOverrideMode(bool override) { bIsOverridden = override; }
     bool isOverridden() const { return bIsOverridden; }
 
-    // 🌟 对外提供的重置请求接口（统一处理时钟倒流与防死锁）
+    void armPreRoll(double rawPpq, double currentPpqPerBar, double bpm);
+    void disarmPreRoll();
+    bool isPreRollArmed() const { return preRollArmed; }
+    bool hasFormalStart() const { return formalStarted; }
+
+    // Anchor current host PPQ as plugin Loop 0 immediately.
+    void anchorToHostPpq(double rawPpq, double currentPpqPerBar);
+
     void requestReset() { bNeedsReset = true; }
 
 private:
@@ -41,4 +50,10 @@ private:
     // 相对时间引擎变量
     double ppqOffset = 0.0;
     bool bNeedsReset = false;
+
+    bool preRollArmed = false;
+    bool formalStarted = false;
+    double preRollStartRawPpq = 0.0;
+    double formalStartRawPpq = 0.0;
+    double preRollBeatsRemaining = 0.0;
 };

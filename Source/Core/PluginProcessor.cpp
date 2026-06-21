@@ -1,7 +1,9 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "../Engine/MarkovEngine.h"
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 LK_Jam_POCProcessor::LK_Jam_POCProcessor()
     : AudioProcessor(BusesProperties()
@@ -17,6 +19,7 @@ LK_Jam_POCProcessor::LK_Jam_POCProcessor()
     cycleBarsParam = apvts.getRawParameterValue("cycleBars");
     modelChoiceParam = apvts.getRawParameterValue("modelChoice");
     fallbackModeParam = apvts.getRawParameterValue("fallbackMode");
+    aiTriggerParam = apvts.getRawParameterValue("aiTrigger");
 
     inferenceThread.setEngine(std::make_unique<MarkovEngine>());
     inferenceThread.startThread();
@@ -38,7 +41,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout LK_Jam_POCProcessor::createP
     layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID("turnBars", 1), "Turn Bars", 1, 16, 4));
     layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID("cycleBars", 1), "Cycle Bars", 2, 32, 8));
     layout.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID("fallbackMode", 1), "Fallback Mode", true));
-    layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID("aiTrigger", 1), "AI Trigger (Auto)", 0.0f, 1.0f, 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID("aiTrigger", 1), "AI Arm / Run", 0.0f, 1.0f, 0.0f));
 
     return layout;
 }
@@ -50,19 +53,89 @@ void LK_Jam_POCProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) 
     playbackQueue.clear();
     inferenceThread.clearQueues();
     activeNotes.fill(false);
+    aiActiveNotes.fill(false);
+    fallbackActiveNotes.fill(false);
     currentAbsoluteSample = 0;
     testTonePhase = 0.0f;
+    metronomePhase = 0.0f;
+    metronomeEnvelope = 0.0f;
+    lastMetronomeBeat = -1;
     uiToAiCount.store(0);
     uiFromAiCount.store(0);
+    isClockRunning.store(false);
+    lastProcessedState = InteractionState::Idle;
+    responseAnchorSet = false;
+    responseAnchorSample = 0;
 }
 
-void LK_Jam_POCProcessor::resetLoopState() {
-    shouldResetClock.store(true);
-    currentAbsoluteSample = 0;
-    syncEngine.requestReset(); // 🌟 通知同步引擎更新相对时间锚点
+bool LK_Jam_POCProcessor::shouldTransportRun() const {
+    const int syncMode = syncEngine.getSyncMode();
+    if (syncMode == 1) {
+        if (auto* playHead = const_cast<LK_Jam_POCProcessor*>(this)->getPlayHead()) {
+            if (playHead->getPosition()) {
+                const bool hostPlaying = playHead->getPosition()->getIsPlaying();
+                const bool triggerArmed = aiTriggerParam != nullptr && aiTriggerParam->load() > 0.5f;
+                return hostPlaying && triggerArmed;
+            }
+        }
+        return false;
+    }
+
+    if (syncMode == 2) {
+        return isTransportRunning.load();
+    }
+
+    return isTransportRunning.load();
+}
+
+void LK_Jam_POCProcessor::flushAllActiveNotes(juce::MidiBuffer& midiMessages, int sampleOffset) {
+    for (int channel = 1; channel <= 16; ++channel) {
+        midiMessages.addEvent(juce::MidiMessage::controllerEvent(channel, 64, 0), sampleOffset);
+        midiMessages.addEvent(juce::MidiMessage::allNotesOff(channel), sampleOffset);
+        midiMessages.addEvent(juce::MidiMessage::allSoundOff(channel), sampleOffset);
+
+        for (int note = 0; note < 128; ++note) {
+            midiMessages.addEvent(juce::MidiMessage::noteOff(channel, note), sampleOffset);
+        }
+    }
+
+    activeNotes.fill(false);
+    aiActiveNotes.fill(false);
+    fallbackActiveNotes.fill(false);
+}
+
+void LK_Jam_POCProcessor::flushPerformanceActiveNotes(juce::MidiBuffer& midiMessages, int sampleOffset) {
+    for (int i = 0; i < 128; ++i) {
+        const auto index = static_cast<size_t>(i);
+        if (activeNotes[index] || aiActiveNotes[index]) {
+            midiMessages.addEvent(juce::MidiMessage::noteOff(1, i), sampleOffset);
+        }
+        activeNotes[index] = false;
+        aiActiveNotes[index] = false;
+    }
+}
+
+void LK_Jam_POCProcessor::clearRuntimeQueues() {
     playbackQueue.clear();
     inferenceThread.clearQueues();
     captureBuffer.clear();
+    cachedNextEvent.reset();
+    responseAnchorSet = false;
+}
+
+void LK_Jam_POCProcessor::resetLoopState(bool clearModelMemory) {
+    shouldResetClock.store(true);
+    if (clearModelMemory) {
+        shouldResetModelMemory.store(true);
+    }
+    currentAbsoluteSample = 0;
+    syncEngine.requestReset();
+    syncEngine.setOverrideMode(false);
+    clearRuntimeQueues();
+    metronomePhase = 0.0f;
+    metronomeEnvelope = 0.0f;
+    lastMetronomeBeat = -1;
+    lastProcessedState = InteractionState::Idle;
 }
 
 void LK_Jam_POCProcessor::releaseResources() {}
@@ -80,44 +153,34 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // 拦截区 A：UI 触发的软复位逻辑 (RESET)
     // ==========================================
     if (shouldResetClock.exchange(false)) {
-        playbackQueue.clear();
-        inferenceThread.clearQueues();
-        captureBuffer.clear();
         midiMessages.clear();
-        syncEngine.requestReset(); // 🌟 确保引擎得到重置指令
-
-        for (int i = 0; i < 128; ++i) {
-            if (activeNotes[static_cast<size_t>(i)] || fallbackActiveNotes[static_cast<size_t>(i)]) {
-                midiMessages.addEvent(juce::MidiMessage::noteOff(1, i), 0);
-            }
+        if (shouldResetModelMemory.exchange(false)) {
+            inferenceThread.clearQueues();
+            inferenceThread.resetModelMemory();
         }
-        activeNotes.fill(false);
-        fallbackActiveNotes.fill(false);
-        for (int i = 1; i <= 16; ++i) midiMessages.addEvent(juce::MidiMessage::allNotesOff(i), 0);
-
+        syncEngine.requestReset();
+        syncEngine.setOverrideMode(false);
+        clearRuntimeQueues();
+        flushAllActiveNotes(midiMessages);
         stateMachine.setState(InteractionState::Idle);
-        cachedNextEvent.reset();
+        isClockRunning.store(false);
+        lastProcessedState = InteractionState::Idle;
     }
 
     // ==========================================
     // 拦截区 B：Panic 紧急避险硬断音
     // ==========================================
     if (panicTriggered.exchange(false)) {
-        playbackQueue.clear();
-        inferenceThread.clearQueues();
-        captureBuffer.clear();
         midiMessages.clear();
-
-        for (int i = 0; i < 128; ++i) {
-            if (activeNotes[static_cast<size_t>(i)] || fallbackActiveNotes[static_cast<size_t>(i)]) {
-                midiMessages.addEvent(juce::MidiMessage::noteOff(1, i), 0);
-            }
+        clearRuntimeQueues();
+        if (panicShouldResetModelMemory.exchange(false)) {
+            inferenceThread.resetModelMemory();
         }
-        activeNotes.fill(false);
-        fallbackActiveNotes.fill(false);
-        for (int i = 1; i <= 16; ++i) midiMessages.addEvent(juce::MidiMessage::allNotesOff(i), 0);
-
-        cachedNextEvent.reset();
+        syncEngine.setOverrideMode(false);
+        flushAllActiveNotes(midiMessages);
+        stateMachine.setState(InteractionState::Idle);
+        isClockRunning.store(false);
+        lastProcessedState = InteractionState::Idle;
         buffer.clear();
         return;
     }
@@ -144,20 +207,58 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // ==========================================
     const auto& currentProg = getActiveProgression();
     int currentTurnBars = turnBarsParam ? static_cast<int>(turnBarsParam->load()) : 4;
-    int currentCycleBars = static_cast<int>(currentProg.measures.size());
+    int currentCycleBars = cycleBarsParam ? static_cast<int>(cycleBarsParam->load()) : 8;
     int modelChoice = modelChoiceParam ? static_cast<int>(modelChoiceParam->load()) : 0;
     bool fallbackEnabled = fallbackModeParam ? (fallbackModeParam->load() > 0.5f) : true;
 
-    syncEngine.update(playHead, stateMachine, currentTurnBars, currentCycleBars, currentSampleRate, buffer.getNumSamples());
+    bool transportRunning = shouldTransportRun();
+
+    if (syncEngine.getSyncMode() == 1) {
+        const bool triggerActive = transportRunning;
+        if (triggerActive && !lastAiTriggerState) {
+            double rawHostPpq = 0.0;
+            double hostPpqPerBar = 4.0;
+            if (playHead != nullptr && playHead->getPosition()) {
+                auto posInfo = playHead->getPosition();
+                rawHostPpq = posInfo->getPpqPosition().orFallback(0.0);
+                auto sig = posInfo->getTimeSignature().orFallback(juce::AudioPlayHead::TimeSignature{4, 4});
+                hostPpqPerBar = std::max(1.0, sig.numerator * (4.0 / static_cast<double>(sig.denominator)));
+            }
+
+            syncEngine.anchorToHostPpq(rawHostPpq, hostPpqPerBar);
+            stateMachine.setState(InteractionState::Listening);
+            clearRuntimeQueues();
+            activeNotes.fill(false);
+            aiActiveNotes.fill(false);
+            fallbackActiveNotes.fill(false);
+            lastProcessedState = InteractionState::Idle;
+        } else if (!triggerActive && lastAiTriggerState) {
+            clearRuntimeQueues();
+            syncEngine.disarmPreRoll();
+            syncEngine.setOverrideMode(false);
+            panicTriggered.store(true);
+        }
+        lastAiTriggerState = triggerActive;
+    }
+
+    isClockRunning.store(transportRunning);
+    syncEngine.update(playHead, stateMachine, currentTurnBars, currentCycleBars, currentSampleRate, buffer.getNumSamples(), transportRunning);
 
     double currentPpq = syncEngine.getCurrentPpq();
-    double totalBeats = std::max(1.0, currentProg.getTotalBeats());
+    double ppqPerBar = syncEngine.getPpqPerBar();
+    double turnBeats = currentTurnBars * ppqPerBar;
+    double fullCycleBeats = turnBeats * 2.0;
+    double totalBeats = std::max(1.0, fullCycleBeats);
 
     // ==========================================
     // 1. 交由 SessionDirector 推动状态机流转
     // ==========================================
-    bool uiForceLearning = isLearning.load();
-    sessionDirector.process(apvts, midiMessages, uiForceLearning);
+    if (transportRunning) {
+        bool uiForceLearning = isLearning.load();
+        sessionDirector.process(apvts, midiMessages, uiForceLearning);
+    } else {
+        isLearning.store(false);
+    }
 
     isHostSynced.store(syncEngine.isUsingHostClock());
     currentBpm.store(syncEngine.getCurrentBpm());
@@ -174,38 +275,69 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     bool loopExpired = (currentProg.totalLoops > 0 && currentPpq >= (totalBeats * currentProg.totalLoops));
 
     if (loopExpired) {
-        playbackQueue.clear();
-        for (int i = 0; i < 128; ++i) {
-            if (fallbackActiveNotes[static_cast<size_t>(i)]) {
-                midiMessages.addEvent(juce::MidiMessage::noteOff(1, i), 0);
-                fallbackActiveNotes[static_cast<size_t>(i)] = false;
-            }
-        }
-        currentState = InteractionState::Idle;
+        DBG("[LK] loopExpired! currentPpq=" << currentPpq << " threshold=" << (totalBeats * currentProg.totalLoops));
     }
 
-    if (syncEngine.isStateChangedThisBlock() && !loopExpired) {
+    if (!transportRunning || loopExpired) {
+        clearRuntimeQueues();
+        syncEngine.setOverrideMode(false);
+        flushAllActiveNotes(midiMessages);
+        stateMachine.setState(InteractionState::Idle);
+        isClockRunning.store(false);
+        currentState = InteractionState::Idle;
+        lastProcessedState = InteractionState::Idle;
+    }
+
+    bool stateChanged = (currentState != lastProcessedState);
+    if (stateChanged) {
+        DBG("[LK] STATE CHANGED -> " << static_cast<int>(currentState)
+            << " ppq=" << currentPpq << " turnBars=" << currentTurnBars
+            << " totalBeats=" << totalBeats << " loopExpired=" << (int)loopExpired);
+        flushAllActiveNotes(midiMessages);
+        lastProcessedState = currentState;
+    }
+
+    if (stateChanged && !loopExpired && transportRunning) {
         if (currentState == InteractionState::Responding) {
-            double currentPpqInLoop = std::fmod(syncEngine.getCurrentPpq(), totalBeats);
+            double progressionBeats = std::max(1.0, currentProg.getTotalBeats());
+            double currentPpqInProgression = std::fmod(syncEngine.getCurrentPpq(), progressionBeats);
 
             Chord mockChord;
             mockChord.rootMidi = 0;
             mockChord.quality = ChordQuality::Major;
 
             if (!currentProg.measures.empty()) {
-                double accumulatedBeats = 0.0;
-                for (const auto& m : currentProg.measures) {
-                    accumulatedBeats += currentProg.getBeatsPerMeasure();
-                    if (currentPpqInLoop < accumulatedBeats) {
-                        if (!m.chord.isEmpty()) mockChord = m.chord;
-                        break;
-                    }
-                }
+                const double beatsPerMeasure = currentProg.getBeatsPerMeasure();
+                int measureIndex = static_cast<int>(currentPpqInProgression / std::max(1.0, beatsPerMeasure));
+                measureIndex = std::clamp(measureIndex, 0, static_cast<int>(currentProg.measures.size()) - 1);
+
+                double ppqInMeasure = currentPpqInProgression - (measureIndex * beatsPerMeasure);
+                const int chordSlots = std::max(1, static_cast<int>(std::round(beatsPerMeasure)));
+                int beatIndex = std::clamp(static_cast<int>(ppqInMeasure), 0, chordSlots - 1);
+
+                auto chord = currentProg.measures[static_cast<size_t>(measureIndex)].getChordForBeat(beatIndex, chordSlots);
+                if (!chord.isEmpty()) mockChord = chord;
             }
 
             if (isAiPlaying.load() && modelChoice > 0) {
                 auto events = captureBuffer.getRecordedEvents();
-                inferenceThread.submitInputPhrase(events, mockChord, currentBlockStartSample);
+                DBG("[LK] RESPONDING: submitting " << (int)events.size() << " events to inference"
+                    << " modelChoice=" << modelChoice << " anchor=" << currentBlockStartSample);
+                const double currentBpmReal = std::max(1.0, syncEngine.getCurrentBpm());
+                const double samplesPerBeat = (currentSampleRate * 60.0) / currentBpmReal;
+                double responseBeats = turnBeats;
+                const auto responseLengthSamples = static_cast<juce::int64>(std::max(1.0, responseBeats * samplesPerBeat));
+                DBG("[LK] responseBeats=" << responseBeats << " responseLengthSamples=" << responseLengthSamples);
+
+                responseAnchorSample = currentBlockStartSample;
+                responseAnchorSet = true;
+
+                inferenceThread.submitInputPhrase(events,
+                                                  mockChord,
+                                                  0,
+                                                  responseLengthSamples,
+                                                  currentSampleRate,
+                                                  currentBpmReal);
 
                 int tCount = 0;
                 for (const auto& e : events) {
@@ -218,30 +350,30 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
                 uiFromAiCount.store(0);
             }
             else if (fallbackEnabled) {
-                if (!mockChord.isEmpty()) {
-                    std::vector<int> intervals = mockChord.getIntervals();
-                    int baseMidi = 60 + mockChord.rootMidi;
+                auto events = captureBuffer.getRecordedEvents();
+                const double currentBpmReal = std::max(1.0, syncEngine.getCurrentBpm());
+                const double samplesPerBeat = (currentSampleRate * 60.0) / currentBpmReal;
+                const auto responseLengthSamples = static_cast<juce::int64>(std::max(1.0, turnBeats * samplesPerBeat));
 
-                    double currentBpmReal = std::max(1.0, syncEngine.getCurrentBpm());
-                    double samplesPerBeat = (currentSampleRate * 60.0) / currentBpmReal;
-                    double measureBeats = currentProg.getBeatsPerMeasure();
-                    int noteSamples = static_cast<int>(samplesPerBeat * measureBeats);
+                responseAnchorSample = currentBlockStartSample;
+                responseAnchorSet = true;
 
-                    for (int i = 0; i < 128; ++i) {
-                        if (fallbackActiveNotes[static_cast<size_t>(i)]) {
-                            midiMessages.addEvent(juce::MidiMessage::noteOff(1, i), 0);
-                            fallbackActiveNotes[static_cast<size_t>(i)] = false;
-                        }
-                    }
+                inferenceThread.submitFallbackPhrase(events,
+                                                     mockChord,
+                                                     0,
+                                                     responseLengthSamples,
+                                                     currentSampleRate,
+                                                     currentBpmReal);
 
-                    for (int interval : intervals) {
-                        int pitch = std::clamp(baseMidi + interval, 0, 127);
-                        playbackQueue.enqueue({(int)currentBlockStartSample, pitch, 80, true});
-                        playbackQueue.enqueue({(int)(currentBlockStartSample + noteSamples), pitch, 0, false});
-
-                        fallbackActiveNotes[static_cast<size_t>(pitch)] = true;
+                int tCount = 0;
+                for (const auto& e : events) {
+                    if (e.isNoteOn && tCount < 16) {
+                        uiToAiPitches[tCount].store(e.pitch);
+                        tCount++;
                     }
                 }
+                uiToAiCount.store(tCount);
+                uiFromAiCount.store(0);
             }
 
             captureBuffer.clear();
@@ -253,10 +385,11 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
             captureBuffer.clear();
             activeNotes.fill(false);
             cachedNextEvent.reset();
+            responseAnchorSet = false;
         }
     }
 
-    if (currentState == InteractionState::Listening) {
+    if (currentState == InteractionState::Listening && !stateChanged) {
         for (const auto metadata : midiMessages) {
             auto msg = metadata.getMessage();
             if (msg.isNoteOn() || msg.isNoteOff()) {
@@ -275,6 +408,9 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     }
     else if (currentState == InteractionState::Responding && isAiPlaying.load()) {
         midiMessages.clear();
+        if (stateChanged) {
+            flushAllActiveNotes(midiMessages);
+        }
         while (true) {
             MidiEventLite eventToCheck;
             if (cachedNextEvent.has_value()) {
@@ -296,16 +432,24 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
                 }
             }
 
-            if (eventToCheck.sampleOffset < currentBlockStartSample) {
+            juce::int64 absoluteEventTime = eventToCheck.sampleOffset + (responseAnchorSet ? responseAnchorSample : currentBlockStartSample);
+
+            if (absoluteEventTime < currentBlockStartSample) {
                 cachedNextEvent.reset();
                 juce::MidiMessage msg = eventToCheck.isNoteOn ? juce::MidiMessage::noteOn(1, eventToCheck.pitch, (juce::uint8)eventToCheck.velocity) : juce::MidiMessage::noteOff(1, eventToCheck.pitch);
                 midiMessages.addEvent(msg, 0);
+                if (eventToCheck.pitch >= 0 && eventToCheck.pitch < 128) {
+                    aiActiveNotes[static_cast<size_t>(eventToCheck.pitch)] = eventToCheck.isNoteOn;
+                }
             }
-            else if (eventToCheck.sampleOffset < currentBlockStartSample + buffer.getNumSamples()) {
+            else if (absoluteEventTime < currentBlockStartSample + buffer.getNumSamples()) {
                 cachedNextEvent.reset();
-                int relativeOffset = static_cast<int>(eventToCheck.sampleOffset - currentBlockStartSample);
+                int relativeOffset = static_cast<int>(absoluteEventTime - currentBlockStartSample);
                 juce::MidiMessage msg = eventToCheck.isNoteOn ? juce::MidiMessage::noteOn(1, eventToCheck.pitch, (juce::uint8)eventToCheck.velocity) : juce::MidiMessage::noteOff(1, eventToCheck.pitch);
                 midiMessages.addEvent(msg, relativeOffset);
+                if (eventToCheck.pitch >= 0 && eventToCheck.pitch < 128) {
+                    aiActiveNotes[static_cast<size_t>(eventToCheck.pitch)] = eventToCheck.isNoteOn;
+                }
             } else {
                 cachedNextEvent = eventToCheck;
                 break;
@@ -313,12 +457,7 @@ void LK_Jam_POCProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         }
     }
 
-    bool isHostPlaying = false;
-    if (playHead && playHead->getPosition()) {
-        isHostPlaying = playHead->getPosition()->getIsPlaying();
-    }
-
-    if (isMetronomeEnabled.load() && isHostPlaying && currentState != InteractionState::Idle) {
+    if (isMetronomeEnabled.load() && transportRunning) {
         int currentBeatInt = static_cast<int>(currentPpq);
 
         if (currentBeatInt != lastMetronomeBeat) {
@@ -354,13 +493,74 @@ juce::AudioProcessorEditor* LK_Jam_POCProcessor::createEditor() { return new LK_
 void LK_Jam_POCProcessor::getStateInformation(juce::MemoryBlock& destData) {
     auto state = apvts.copyState();
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
-    if (xml != nullptr) copyXmlToBinary(*xml, destData);
+    if (xml != nullptr) {
+        const auto& prog = getActiveProgression();
+        auto* progXml = new juce::XmlElement("Progression");
+        progXml->setAttribute("name", prog.name);
+        progXml->setAttribute("timeSigNum", prog.timeSigNum);
+        progXml->setAttribute("timeSigDen", prog.timeSigDen);
+        progXml->setAttribute("totalLoops", prog.totalLoops);
+        progXml->setAttribute("measures", static_cast<int>(prog.measures.size()));
+
+        const int chordSlots = std::max(1, static_cast<int>(std::round(prog.getBeatsPerMeasure())));
+        for (int measureIndex = 0; measureIndex < static_cast<int>(prog.measures.size()); ++measureIndex) {
+            const auto& measure = prog.measures[static_cast<size_t>(measureIndex)];
+            auto* measureXml = new juce::XmlElement("Measure");
+            measureXml->setAttribute("index", measureIndex);
+            measureXml->setAttribute("chord", measure.chord.name);
+
+            for (int beat = 0; beat < chordSlots; ++beat) {
+                const auto chord = measure.getChordForBeat(beat, chordSlots);
+                if (!chord.isEmpty()) {
+                    auto* beatXml = new juce::XmlElement("Beat");
+                    beatXml->setAttribute("index", beat);
+                    beatXml->setAttribute("chord", chord.name);
+                    measureXml->addChildElement(beatXml);
+                }
+            }
+
+            progXml->addChildElement(measureXml);
+        }
+
+        xml->addChildElement(progXml);
+        copyXmlToBinary(*xml, destData);
+    }
 }
+
 void LK_Jam_POCProcessor::setStateInformation(const void* data, int sizeInBytes) {
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
     if (xmlState != nullptr) {
         if (xmlState->hasTagName(apvts.state.getType())) {
-            apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
+            auto stateTree = juce::ValueTree::fromXml(*xmlState);
+            apvts.replaceState(stateTree);
+
+            if (auto* progXml = xmlState->getChildByName("Progression")) {
+                const int measures = std::max(1, progXml->getIntAttribute("measures", 16));
+                Progression prog(progXml->getStringAttribute("name", "Restored Song"), measures);
+                prog.timeSigNum = std::max(1, progXml->getIntAttribute("timeSigNum", 4));
+                prog.timeSigDen = std::max(1, progXml->getIntAttribute("timeSigDen", 4));
+                prog.totalLoops = std::max(0, progXml->getIntAttribute("totalLoops", 0));
+                const int chordSlots = std::max(1, static_cast<int>(std::round(prog.getBeatsPerMeasure())));
+
+                for (auto* measureXml : progXml->getChildIterator()) {
+                    if (!measureXml->hasTagName("Measure")) continue;
+                    const int measureIndex = measureXml->getIntAttribute("index", -1);
+                    if (measureIndex < 0 || measureIndex >= static_cast<int>(prog.measures.size())) continue;
+
+                    auto& measure = prog.measures[static_cast<size_t>(measureIndex)];
+                    measure.ensureBeatChords(chordSlots);
+                    measure.chord = Chord::fromString(measureXml->getStringAttribute("chord", ""));
+
+                    for (auto* beatXml : measureXml->getChildIterator()) {
+                        if (!beatXml->hasTagName("Beat")) continue;
+                        const int beatIndex = beatXml->getIntAttribute("index", -1);
+                        if (beatIndex < 0 || beatIndex >= chordSlots) continue;
+                        measure.beatChords[static_cast<size_t>(beatIndex)] = Chord::fromString(beatXml->getStringAttribute("chord", ""));
+                    }
+                }
+
+                setActiveProgression(prog);
+            }
         }
     }
 }

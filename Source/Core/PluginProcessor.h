@@ -59,6 +59,7 @@ public:
     SyncEngine& getSyncEngine() { return syncEngine; }
 
     std::atomic<bool> panicTriggered{false};
+    std::atomic<bool> panicShouldResetModelMemory{false};
     std::atomic<bool> isHostSynced{false};
     std::atomic<double> currentBpm{120.0};
     std::atomic<double> currentLatencyMs{0.0};
@@ -66,6 +67,8 @@ public:
 
     std::atomic<bool> isAiPlaying{true};
     std::atomic<bool> isTestToneEnabled{false};
+    std::atomic<bool> isTransportRunning{false};
+    std::atomic<bool> isClockRunning{false};
 
     std::atomic<bool> isLearning{false};
 
@@ -79,7 +82,11 @@ public:
     float metronomePhase = 0.0f;
     float metronomeEnvelope = 0.0f;
     int lastMetronomeBeat = -1;
-    void resetLoopState();
+    void resetLoopState(bool clearModelMemory = false);
+    bool shouldTransportRun() const;
+    void flushAllActiveNotes(juce::MidiBuffer& midiMessages, int sampleOffset = 0);
+    void flushPerformanceActiveNotes(juce::MidiBuffer& midiMessages, int sampleOffset = 0);
+    void clearRuntimeQueues();
 
     // 🌟 修复：完美消除 1 帧视觉闪烁
     double getCurrentRelativePpq() const {
@@ -106,13 +113,18 @@ private:
     InferenceThread inferenceThread;
 
     std::array<bool, 128> activeNotes {false};
+    std::array<bool, 128> aiActiveNotes {false};
 
     std::atomic<float>* turnBarsParam = nullptr;
     std::atomic<float>* cycleBarsParam = nullptr;
     std::atomic<float>* modelChoiceParam = nullptr;
     std::atomic<float>* fallbackModeParam = nullptr;
+    std::atomic<float>* aiTriggerParam = nullptr;
 
     std::optional<MidiEventLite> cachedNextEvent;
+
+    juce::int64 responseAnchorSample = 0;
+    bool responseAnchorSet = false;
 
     juce::int64 currentAbsoluteSample = 0;
 
@@ -120,8 +132,11 @@ private:
     float testTonePhase = 0.0f;
 
     std::atomic<bool> shouldResetClock { false };
+    std::atomic<bool> shouldResetModelMemory { false };
     std::atomic<double> ppqOffset { 0.0 };
     std::array<bool, 128> fallbackActiveNotes { false };
+    InteractionState lastProcessedState = InteractionState::Idle;
+    bool lastAiTriggerState = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LK_Jam_POCProcessor)
 };

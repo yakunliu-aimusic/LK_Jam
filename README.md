@@ -48,6 +48,7 @@ LK_Jam/
     - UI_GridCanvas.h         # GUI layout grid
     - UI_ChordDeck.h          # Chord progression display
     - UI_TransportBar.h       # Play/reset/metronome bar
+  - Assets/
 - README.md
 ```
 
