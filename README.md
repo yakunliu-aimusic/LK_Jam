@@ -2,6 +2,8 @@
 A low-latency human-AI improvisation VST3/AU plugin built with **JUCE + RTNeural**, implementing jazz-style Trading Fours turn-based jam with role-aware GRU and Markov-chain fallback engine.
 > The project is under continuous iteration. Markov algorithm is introduced for plugin debugging and verification, sourced from [ai-improviser-plugin](https://github.com/yeeking/ai-improviser-plugin). Thanks to the original author for open source contribution.
 
+
+
 Demo Videos:
 
 
