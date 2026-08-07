@@ -2,6 +2,10 @@
 A low-latency human-AI improvisation VST3/AU plugin built with **JUCE + RTNeural**, implementing jazz-style Trading Fours turn-based jam with role-aware GRU and Markov-chain fallback engine.
 > The project is under continuous iteration. Markov algorithm is introduced for plugin debugging and verification, sourced from [ai-improviser-plugin](https://github.com/yeeking/ai-improviser-plugin). Thanks to the original author for open source contribution.
 
+Demo Videos:
+LK_Jam – Real-Time Interactive AI Generative Plugin
+https://youtu.be/ipnVo04R7bA?si=tQyQG-xEdf1EshvH
+
 ## ✨ Key Features
 - Ultra-low-latency neural inference powered by RTNeural: compile-time network instantiation, allocation-free & wait-free real-time audio-thread computation
 - Jazz-inspired turn-taking interaction: configurable human/AI alternating bars with host BPM & timeline sync (Listen → Respond → Idle state machine)
