@@ -3,6 +3,8 @@ A low-latency human-AI improvisation VST3/AU plugin built with **JUCE + RTNeural
 > The project is under continuous iteration. Markov algorithm is introduced for plugin debugging and verification, sourced from [ai-improviser-plugin](https://github.com/yeeking/ai-improviser-plugin). Thanks to the original author for open source contribution.
 
 Demo Videos:
+
+
 LK_Jam – Real-Time Interactive AI Generative Plugin
 https://youtu.be/ipnVo04R7bA?si=tQyQG-xEdf1EshvH
 
