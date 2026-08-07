@@ -7,7 +7,6 @@ A low-latency human-AI improvisation VST3/AU plugin built with **JUCE + RTNeural
 Demo Videos:
 
 
-LK_Jam – Real-Time Interactive AI Generative Plugin
 https://youtu.be/ipnVo04R7bA?si=tQyQG-xEdf1EshvH
 
 ## ✨ Key Features
